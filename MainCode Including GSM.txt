@@ -1,0 +1,704 @@
+#define GSerial Serial1
+int flag=0; 
+const char lin[] = "POST /update HTTP/1.1Host: api.thingspeak.com\nConnection: close\nX-THINGSPEAKAPIKEY: XD01FJMRCZCCYOGA\nContent-Type: xapplication/x-form-urlencoded\nContent-Length: ";
+char lin1[400];
+char lin2[100];
+char str_arr[15];
+char buff[10];
+char aux_str[15];
+float g_temp,g_hum,g_pres,g_acc,g_bpm,g_sys,g_dia;
+unsigned long previousMillis;
+
+//pressure
+#include <Wire.h>
+#include <Adafruit_BMP085.h>
+Adafruit_BMP085 bmp;
+
+//temp
+#include <OneWire.h>
+OneWire  ds(2);  // on pin 2 (a 4.7K resistor is necessary)
+
+//humidity
+#include "DHT.h"
+#define DHTPIN 2     // what pin we're connected to
+#define DHTTYPE DHT22   // DHT 22  (AM2302)
+DHT dht(DHTPIN, DHTTYPE);
+
+//bmp
+char sbuffer[30], ch;
+byte pos, read1, read2, read3;
+
+//accelo
+const int groundpin = 18;             // analog input pin 4 -- ground
+const int powerpin = 19;              // analog input pin 5 -- voltage
+const int xpin = A3;                  // x-axis of the accelerometer
+const int ypin = A2;                  // y-axis
+const int zpin = A1;                  // z-axis (only on 3-axis models)
+int r,a,b,c;
+
+//pulse
+int pulsePin = 0;                 // Pulse Sensor purple wire connected to analog pin 0
+int fadeRate = 0;                 // used to fade LED on with PWM on fadePin
+ 
+
+// Volatile Variables, used in the interrupt service routine!
+volatile int BPM;                   // int that holds raw Analog in 0. updated every 2mS
+volatile int Signal;                // holds the incoming raw data
+volatile int IBI = 600;             // int that holds the time interval between beats! Must be seeded!
+volatile boolean Pulse = true;     // "True" when User's live heartbeat is detected. "False" when not a "live beat".
+volatile boolean QS = true;        // becomes true when Arduoino finds a beat.
+ 
+ 
+volatile int rate[10];                    // array to hold last ten IBI values
+volatile unsigned long sampleCounter = 0;          // used to determine pulse timing
+volatile unsigned long lastBeatTime = 0;           // used to find IBI
+volatile int P =512;                      // used to find peak in pulse wave, seeded
+volatile int T = 512;                     // used to find trough in pulse wave, seeded
+volatile int thresh = 525;                // used to find instant moment of heart beat, seeded
+volatile int amp = 100;                   // used to hold amplitude of pulse waveform, seeded
+volatile boolean firstBeat = true;        // used to seed rate array so we startup with reasonable BPM
+volatile boolean secondBeat = false;      // used to seed rate array so we startup with reasonable BPM
+
+
+
+//pulse interpt 
+
+  void interruptSetup(){    
+    // Initializes Timer2 to throw an interrupt every 2mS.
+    TCCR2A = 0x02;     // DISABLE PWM ON DIGITAL PINS 3 AND 11, AND GO INTO CTC MODE
+    TCCR2B = 0x06;     // DON'T FORCE COMPARE, 256 PRESCALER
+    OCR2A = 0X7C;      // SET THE TOP OF THE COUNT TO 124 FOR 500Hz SAMPLE RATE
+    TIMSK2 = 0x02;     // ENABLE INTERRUPT ON MATCH BETWEEN TIMER2 AND OCR2A
+    sei();             // MAKE SURE GLOBAL INTERRUPTS ARE ENABLED     
+  }
+ 
+ 
+  // THIS IS THE TIMER 2 INTERRUPT SERVICE ROUTINE.
+  // Timer 2 makes sure that we take a reading every 2 miliseconds
+  ISR(TIMER2_COMPA_vect){                         // triggered when Timer2 counts to 124
+      cli();                                      // disable interrupts while we do this
+      Signal = analogRead(pulsePin);              // read the Pulse Sensor
+      sampleCounter += 2;                         // keep track of the time in mS with this variable
+      int N = sampleCounter - lastBeatTime;       // monitor the time since the last beat to avoid noise
+ 
+    //  find the peak and trough of the pulse wave
+    if(Signal < thresh && N > (IBI/5)*3){       // avoid dichrotic noise by waiting 3/5 of last IBI
+    if (Signal < T){                        // T is the trough
+      T = Signal;                         // keep track of lowest point in pulse wave
+    }
+  }
+ 
+  if(Signal > thresh && Signal > P){          // thresh condition helps avoid noise
+    P = Signal;                             // P is the peak
+  }                                        // keep track of highest point in pulse wave
+ 
+  //  NOW IT'S TIME TO LOOK FOR THE HEART BEAT
+  // signal surges up in value every time there is a pulse
+  if (N > 250){                                   // avoid high frequency noise
+    if ( (Signal > thresh) && (Pulse == false) && (N > (IBI/5)*3) ){       
+      Pulse = true;                               // set the Pulse flag when we think there is a pulse
+  //    digitalWrite(blinkPin,HIGH);                // turn on pin 13 LED
+      IBI = sampleCounter - lastBeatTime;         // measure time between beats in mS
+      lastBeatTime = sampleCounter;               // keep track of time for next pulse
+ 
+      if(secondBeat){                        // if this is the second beat, if secondBeat == TRUE
+        secondBeat = false;                  // clear secondBeat flag
+        for(int i=0; i<=9; i++){             // seed the running total to get a realisitic BPM at startup
+          rate[i] = IBI;                     
+        }
+      }
+ 
+      if(firstBeat){                         // if it's the first time we found a beat, if firstBeat == TRUE
+        firstBeat = false;                   // clear firstBeat flag
+        secondBeat = true;                   // set the second beat flag
+        sei();                               // enable interrupts again
+        return;                              // IBI value is unreliable so discard it
+      }  
+ 
+ 
+      // keep a running total of the last 10 IBI values
+      word runningTotal = 0;                  // clear the runningTotal variable   
+ 
+      for(int i=0; i<=8; i++){                // shift data in the rate array
+        rate[i] = rate[i+1];                  // and drop the oldest IBI value
+        runningTotal += rate[i];              // add up the 9 oldest IBI values
+      }
+ 
+      rate[9] = IBI;                          // add the latest IBI to the rate array
+      runningTotal += rate[9];                // add the latest IBI to runningTotal
+      runningTotal /= 10;                     // average the last 10 IBI values
+      BPM = 60000/runningTotal;               // how many beats can fit into a minute? that's BPM!
+      QS = true;                              // set Quantified Self flag
+      // QS FLAG IS NOT CLEARED INSIDE THIS ISR
+    }                      
+  }
+ 
+  if (Signal < thresh && Pulse == true){   // when the values are going down, the beat is over
+//    digitalWrite(blinkPin,LOW);            // turn off pin 13 LED
+    Pulse = false;                         // reset the Pulse flag so we can do it again
+    amp = P - T;                           // get amplitude of the pulse wave
+    thresh = amp/2 + T;                    // set thresh at 50% of the amplitude
+    P = thresh;                            // reset these for next time
+    T = thresh;
+  }
+ 
+  if (N > 2500){                           // if 2.5 seconds go by without a beat
+    thresh = 512;                          // set thresh default
+    P = 512;                               // set P default
+    T = 512;                               // set T default
+    lastBeatTime = sampleCounter;          // bring the lastBeatTime up to date       
+    firstBeat = true;                      // set these to avoid noise
+    secondBeat = false;                    // when we get the heartbeat back
+  }
+ 
+  sei();                                   // enable interrupts when youre done!
+}// end isr
+ 
+ 
+ 
+ 
+ 
+// Regards Serial OutPut  -- Set This Up to your needs
+static boolean serialVisual = true;   // Set to 'false' by Default.  Re-set to 'true' to see Arduino Serial Monitor ASCII Visual Pulse
+ 
+
+void setup(){
+
+  Serial.begin(9600);
+//pulse 
+ //Serial.begin(115200);             // we agree to talk fast!
+  interruptSetup();                 // sets up to read Pulse Sensor signal every 2mS
+
+  initialize_gsm900();
+
+
+//pressure
+   if (!bmp.begin()) {
+  Serial.println("Could not find a valid BMP085 sensor, check wiring!");
+  while (1) {}
+   }
+  
+  // -=-=- Intialize variables -=-=-= bp 
+  pos = 0;
+
+
+
+  //humidty 
+   Serial.println("Health Monitor!");
+
+  dht.begin();
+
+
+  //accelo
+   pinMode(groundpin, OUTPUT);
+  pinMode(powerpin, OUTPUT);
+  digitalWrite(groundpin, LOW);
+  digitalWrite(powerpin, HIGH);
+
+  
+}
+
+
+
+
+
+
+
+
+// -=-=- Program Loop -=-=-=
+void loop() 
+  {  if (QS == true){              // A Heartbeat Was Found
+           //serialOutput() ;                      // BPM and IBI have been Determined
+        fadeRate = 255;         // Makes the LED Fade Effect Happen
+                                // Set 'fadeRate' Variable to 255 to fade LED with pulse
+        serialOutputWhenBeatHappens();   // A Beat Happened, Output that to serial.    
+        QS = false;                      // reset the Quantified Self flag for next time   
+    }
+    
+      ledFadeToBeat(); // Makes the LED Fade Effect Happen
+ 
+     pressure();
+     temp();
+     blood();
+     accelo();
+      Serial.println("**********************************************\n");
+      delay(2000);
+     
+     //humidity
+    {
+      // Wait a few seconds between measurements.
+    
+  // Reading temperature or humidity takes about 250 milliseconds!
+  // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+  float h = dht.readHumidity();
+  // Read temperature as Celsius (the default)
+  float t = dht.readTemperature();
+  // Read temperature as Fahrenheit (isFahrenheit = true)
+  float f = dht.readTemperature(true);
+
+  // Check if any reads failed and exit early (to try again).
+  if (isnan(h) || isnan(t) || isnan(f)) 
+   {
+    Serial.println("Failed to read from DHT sensor!");
+    return;
+   }
+ 
+  // Compute heat index in Fahrenheit (the default)
+  float hif = dht.computeHeatIndex(f, h);
+  // Compute heat index in Celsius (isFahreheit = false)
+  float hic = dht.computeHeatIndex(t, h, false);
+
+  g_hum = h;
+  Serial.print("Humidity: ");
+  Serial.println(h);
+ 
+
+}
+
+  if(millis() - previousMillis > 30000)
+  {
+    upload_data();
+    previousMillis = millis();
+  }
+     
+}
+
+  
+     
+void accelo(){
+ 
+ // print the sensor values:
+ Serial.print("Accelerometer Readings   ");
+  Serial.print(analogRead(xpin));
+a = analogRead(xpin);  // print a tab between values:
+  Serial.print("\t");
+  Serial.print(analogRead(ypin));
+b = analogRead(ypin);
+  // print a tab between values:
+  Serial.print("\t");
+  Serial.print(analogRead(zpin));
+  Serial.print("\n");
+  c = analogRead(zpin);
+   r = ((a+b+c)/3);
+  Serial.print("Average is :   ");
+  g_acc = r;
+  Serial.println(r);
+  Serial.println();
+   
+  // delay before next reading:
+ 
+
+}
+
+//pressure
+void pressure()
+{
+    Serial.print("Pressure = ");
+    g_pres = bmp.readPressure();
+    Serial.print(bmp.readPressure());
+    Serial.println(" Pa");
+      
+    Serial.println();
+    
+}
+
+
+
+
+//tempertaure
+void temp()
+   {
+   
+
+  byte i;
+
+  byte present = 0;
+  byte type_s;
+  byte data[12];
+  byte addr[8];
+  float celsius, fahrenheit;
+
+    if ( !ds.search(addr))
+     {
+    ds.reset_search();
+    
+    return;
+     }
+  for( i = 0; i < 8; i++){
+  
+  }
+
+  if (OneWire::crc8(addr, 7) != addr[7]) {
+      Serial.println("CRC is not valid!");
+      return;
+  }
+  Serial.println();
+
+  // the first ROM byte indicates which chip
+  switch (addr[0]) {
+    case 0x10:
+      Serial.println("  Chip = DS18S20");  // or old DS1820
+      type_s = 1;
+      break;
+    case 0x28:
+      Serial.println("  Chip = DS18B20");
+      type_s = 0;
+      break;
+    case 0x22:
+      Serial.println("  Chip = DS1822");
+      type_s = 0;
+      break;
+    default:
+      Serial.println("Device is not a DS18x20 family device.");
+      return;
+  } 
+
+  ds.reset();
+  ds.select(addr);
+  ds.write(0x44);        // start conversion, use ds.write(0x44,1) with parasite power on at the end
+
+       // maybe 750ms is enough, maybe not
+  // we might do a ds.depower() here, but the reset will take care of it.
+
+  present = ds.reset();
+  ds.select(addr);    
+  ds.write(0xBE);         // Read Scratchpad
+
+ 
+  for ( i = 0; i < 9; i++) {           // we need 9 bytes
+    data[i] = ds.read();
+   
+  }
+ 
+  int16_t raw = (data[1] << 8) | data[0];
+  if (type_s) {
+    raw = raw << 3; // 9 bit resolution default
+    if (data[7] == 0x10) {
+      // "count remain" gives full 12 bit resolution
+      raw = (raw & 0xFFF0) + 12 - data[6];
+    }
+  } else {
+    byte cfg = (data[4] & 0x60);
+    // at lower res, the low bits are undefined, so let's zero them
+    if (cfg == 0x00) raw = raw & ~7;  // 9 bit resolution, 93.75 ms
+    else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
+    else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
+    //// default is 12 bit resolution, 750 ms conversion time
+  }
+  celsius = (float)raw / 16.0;
+  fahrenheit = celsius * 1.8 + 37.0;
+  Serial.print("  Temperature = ");
+  Serial.print(celsius);
+  Serial.print(" Celsius, ");
+  Serial.print(fahrenheit);
+  Serial.println(" Fahrenheit");
+  g_temp = fahrenheit;
+   }
+
+
+
+
+  
+//blood pressure
+
+void blood(){
+while(Serial.available() > 0)
+  {
+    ch = Serial.read(); //loop till character received
+    if(ch == 0x0A) // if received character is <LF>, 0x0A, 10 then process buffer
+    {
+      pos = 0; // buffer position reset for next reading
+      
+      // extract data from serial buffer to 8 bit integer value
+      // convert data from ASCII to decimal
+      read1 = ((sbuffer[1]-'0')*100) + ((sbuffer[2]-'0')*10) +(sbuffer[3]-'0');
+      read2 = ((sbuffer[6]-'0')*100) + ((sbuffer[7]-'0')*10) +(sbuffer[8]-'0');
+      read3 = ((sbuffer[11]-'0')*100) + ((sbuffer[12]-'0')*10) +(sbuffer[13]-'0');
+   Serial.println("BP Module...");
+   Serial.print(read1);
+   Serial.print("  , " );
+   Serial.print(read2);
+   Serial.print("  , " );
+   Serial.println(read3);
+      // Do whatever you wish to do with this sensor integer variables
+      // Show on LCD or Do some action as per your application
+      // Value of variables will be between 0-255
+      
+    } 
+    else 
+    { //store serial data to buffer
+      sbuffer[pos++] = ch;
+      if(pos > sizeof(sbuffer))
+      {
+        pos = 0;
+      }
+      
+    }
+  } // end while
+
+}
+
+
+
+
+
+
+
+
+ 
+ 
+//  Decides How To OutPut BPM and IBI Data
+void serialOutputWhenBeatHappens(){   
+ if (serialVisual == true){            //  Code to Make the Serial Monitor Visualizer Work
+    Serial.print("Plse Rate (beats per minute) ");  //ASCII Art Madness
+    Serial.print("BPM: ");
+    Serial.println(BPM);
+    g_bpm = BPM;
+    Serial.print("  ");
+ } 
+}
+ 
+ 
+
+void ledFadeToBeat(){
+    fadeRate -= 15;                         //  set LED fade value
+    fadeRate = constrain(fadeRate,0,255);   //  keep LED fade value from going into negative numbers!
+    //analogWrite(fadePin,fadeRate);          //  fade LED
+  }
+ 
+//  All Serial Handling Code,
+//  It's Changeable with the 'serialVisual' variable
+//  Set it to 'true' or 'false' when it's declared at start of code. 
+ 
+
+
+ 
+//  Sends Data to Pulse Sensor Processing App, Native Mac App, or Third-party Serial Readers.
+void sendDataToSerial(char symbol, int data ){
+    Serial.print(symbol);
+ 
+    Serial.println(data);               
+  }
+
+
+
+  //*************************************************
+int8_t sendATcommand2(char* ATcommand, char* expected_answer1, char* expected_answer2, unsigned int timeout)      //This function sends command to the GSM Modem and wait for reply according to arguments
+{
+
+    uint8_t x=0,  answer=0;
+    char response[300];
+    unsigned long previous;
+
+    memset(response, '\0', 100);    // Initialize the string
+
+    delay(100);
+
+    while( GSerial.available() > 0) GSerial.read();    // Clean the input buffer
+
+    GSerial.println(ATcommand);    // Send the AT command 
+
+    x = 0;
+    previous = millis();
+
+    // this loop waits for the answer
+    do{
+        // if there are data in the UART input buffer, reads it and checks for the asnwer
+        if(GSerial.available() != 0){    
+            response[x] = GSerial.read();
+            // check if the desired answer 1  is in the response of the module
+            if (strstr(response, expected_answer1) != NULL)    
+            {
+                answer = 1;
+            }
+            // check if the desired answer 2 is in the response of the module
+            else if (strstr(response, expected_answer2) != NULL)    
+            {
+                answer = 2;
+            }
+        }
+    }
+    // Waits for the asnwer with time out
+    while((answer == 0) && ((millis() - previous) < timeout));    
+
+    return answer;
+}
+//*************************************************
+int initialize_gsm900()
+{
+  int ret1=0;
+  GSerial.begin(9600);
+  Serial.println("GSM Initializing...");
+  delay(9000);                                          //Recent Change
+  ret1 = sendATcommand2("AT", "OK", "OK", 2000);        //Recent Change     // Send AT command and test for any response from GSM
+  //ret1 = sendATcommand2("AT", "OK", "OK", 2000);
+  if(ret1==1 || ret1==2)
+  {
+    //lcd.setCursor(0, 0);lcd.print("GSM Detected    ");
+    Serial.println("GSM Detected");
+    //---digitalWrite(led1, HIGH);        //GSM Modem Detected 
+    flag=1;                          //First LED is On
+  }          
+  else
+  {
+    Serial.println("GSM Not Detected");
+    //lcd.setCursor(0, 0);lcd.print("GSM Not Detected");
+    while(1);
+  }
+  delay(2000);
+  sendATcommand2("AT+CIPSHUT", "OK", "ERROR", 10000);    //CLose any previous TCP socket connection
+  Serial.println("CIPSHUT OK");
+  delay(5000);
+  //while( sendATcommand2("AT+CREG?", "+CREG: 0,1", "+CREG: 0,5", 30000)== 0 );    // If registered to home network or roaming
+     Serial.println("CREG OK");
+    // Selects Single-connection mode
+    if (sendATcommand2("AT+CIPMUX=0", "OK", "ERROR", 1000) == 1)
+    {
+        Serial.println("CIPMUX OK");
+        // Waits for status IP INITIAL
+        while(sendATcommand2("AT+CIPSTATUS", "INITIAL", "", 500)  == 0 );
+        delay(5000);
+        
+        // Sets the APN, user name and password
+        if (sendATcommand2("AT+CSTT=\"www\",\"\",\"\"", "OK",  "ERROR", 30000) == 1)
+        {            
+            Serial.println("CSTT OK");
+            // Waits for status IP START
+            while(sendATcommand2("AT+CIPSTATUS", "START", "", 500)  == 0 );
+            delay(5000);
+            
+            // Brings Up Wireless Connection
+            if (sendATcommand2("AT+CICR", "OK", "ERROR", 30000) == 1)
+            {
+                Serial.println("CIICR OK");
+                // Waits for status IP GPRSACT
+                while(sendATcommand2("AT+CIPSTATUS", "GPRSACT", "", 500)  == 0 );
+                delay(5000);
+                
+                // Gets Local IP Address
+                if (sendATcommand2("AT+CIFSR", ".", "ERROR", 10000) == 1)
+                {
+                    Serial.println("CIFSR OK");
+                    // Waits for status IP STATUS
+                    while(sendATcommand2("AT+CIPSTATUS", "IP STATUS", "", 500)  == 0 );
+                    delay(5000);
+                    //Serial.println("Openning TCP");
+                    flag=2;
+                    //lcd.setCursor(0, 0);lcd.print("IP ACQUIRED     ");
+                    Serial.println("IP ACQUIRED");
+                    delay(2000);
+                    //digitalWrite(led2, HIGH);        //GSM GPRS Active and IP assigned, now send data // Second LED turned on
+                    return 0;
+                    
+                }
+                else
+                {
+                    //lcd.setCursor(0, 0);lcd.print("IP NOT ACQUIRED ");
+                    Serial.println("IP Not Acquired");
+                    delay(2000);                    
+                    //Serial.println("Error getting the IP address");
+                }  
+            }
+            else
+            {
+                //Serial.println("Error bring up wireless connection");
+            }
+        }
+        else
+        {
+            //Serial.println("Error setting the APN");
+        } 
+    }
+    else
+    {
+        //Serial.println("Error setting the single connection");
+    }
+    
+    sendATcommand2("AT+CIPSHUT", "OK", "ERROR", 10000);     //Shutdown GPRS connection
+    delay(10000);
+    return 1;  
+}
+//*************************************************
+void upload_data()
+{
+  //Uploading on Server Starts
+//  GSerial.listen();  
+  
+  if (sendATcommand2("AT+CIPSTART=\"TCP\",\"184.106.153.149\",\"80\"",       //Start TCP socket connection to thingspeak server
+            "CONNECT OK", "CONNECT FAIL", 30000) == 1)
+  {
+    /*
+    lcd.clear();
+    lcd.setCursor(0, 0);   
+    lcd.print("GPRS CONNECTED");  
+    lcd.setCursor(0, 1);   
+    lcd.print("UPLOADING");  
+    */
+    Serial.println("TCP Connection Established");
+    delay(2000);
+    
+    strcpy(lin2,"field1=");
+    dtostrf(g_temp,4,2,str_arr);
+    strcat(str_arr,"\0");
+    strcat(lin2,str_arr);
+    
+    strcat(lin2,"&field2=");
+    dtostrf(g_hum,4,2,str_arr);
+    strcat(str_arr,"\0");
+    strcat(lin2,str_arr);
+    
+    strcat(lin2,"&field3=");
+    dtostrf(g_pres,4,2,str_arr);
+    strcat(str_arr,"\0");
+    strcat(lin2,str_arr);
+
+    strcat(lin2,"&field4=");
+    dtostrf(g_bpm,4,2,str_arr);
+    strcat(str_arr,"\0");
+    strcat(lin2,str_arr);
+
+    strcat(lin2,"&field5=");
+    dtostrf(g_acc,4,2,str_arr);
+    strcat(str_arr,"\0");
+    strcat(lin2,str_arr);
+
+    strcat(lin2,"&field6=");
+    dtostrf(read1,4,2,str_arr);
+    strcat(str_arr,"\0");
+    strcat(lin2,str_arr);
+
+    strcat(lin2,"&field7=");
+    dtostrf(read2,4,2,str_arr);
+    strcat(str_arr,"\0");
+    strcat(lin2,str_arr);
+    
+    sprintf(buff,"%d",strlen(lin2));
+
+    strcpy(lin1,lin);
+    strcat(lin1,buff);    
+    strcat(lin1,"\n\n"); 
+    strcat(lin1,lin2);  
+    strcat(lin1,"\n\n");
+    strcat(lin1,"\0");
+    
+    sprintf(aux_str,"AT+CIPSEND=%d", strlen(lin1));
+    if (sendATcommand2(aux_str, ">", "ERROR", 10000) == 1)          //Actually here data is sent to thingspeak server
+    {
+        sendATcommand2(lin1, "SEND OK", "ERROR", 100);
+        Serial.println("Thingspeak Data Upload...OK");
+        //lcd.print("...Done");  
+    }
+    else
+    {
+        Serial.println("Thingspeak Data Upload...Fail");
+        //lcd.print("...Fail");  
+    }
+    delay(15000);
+  }
+  else
+  {
+    //lcd.setCursor(0, 0);   
+    //lcd.print("GPRS NOT CONNECT");  
+    Serial.println("GPRS Not Connect");
+  }
+}
